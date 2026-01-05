@@ -7,7 +7,8 @@ import {buildSafariPreferences, SAFARI_BUNDLE_ID} from '../app-utils';
 import {log as defaultLogger} from '../logger';
 import { Devicectl } from 'node-devicectl';
 import type { AppiumLogger } from '@appium/types';
-import type { XCUITestDriver } from '../driver';
+import type { XCUITestDriver, XCUITestDriverOpts } from '../driver';
+import { startAfcService } from './afc-service';
 
 const DEFAULT_APP_INSTALLATION_TIMEOUT_MS = 8 * 60 * 1000;
 export const IO_TIMEOUT_MS = 4 * 60 * 1000;
@@ -55,56 +56,106 @@ export async function pullFolder(afcService: any, remoteRootPath: string): Promi
     let countFilesSuccess = 0;
     let countFilesFail = 0;
     let countFolders = 0;
-    const pullPromises: B<void>[] = [];
+
+    // Check if the AFC service requires serial operations (remotexpc does, appium-ios-device doesn't)
+    const requiresSerialOps = afcService.requiresSerialOperations === true;
+
+    // Phase 1: Walk the directory tree and collect all paths first
+    // This is necessary because remotexpc's AFC cannot handle interleaved
+    // operations (walkDir calling stat while a read stream is active)
+    const filesToPull: Array<{remotePath: string; localPath: string}> = [];
+    const dirsToCreate: string[] = [];
+
     await afcService.walkDir(remoteRootPath, true, async (remotePath: string, isDir: boolean) => {
       const localPath = path.join(tmpFolder, remotePath);
-      const dirname = isDir ? localPath : path.dirname(localPath);
-      if (!(await folderExists(dirname))) {
-        await mkdirp(dirname);
-      }
       if (!localTopItem || localPath.split(path.sep).length < localTopItem.split(path.sep).length) {
         localTopItem = localPath;
       }
       if (isDir) {
+        dirsToCreate.push(localPath);
         ++countFolders;
-        return;
+      } else {
+        filesToPull.push({remotePath, localPath});
       }
+    });
 
-      const readStream = await afcService.createReadStream(remotePath, {autoDestroy: true});
-      const writeStream = fs.createWriteStream(localPath, {autoClose: true});
-      pullPromises.push(
-        new B<void>((resolve) => {
-          writeStream.on('close', () => {
-            ++countFilesSuccess;
-            resolve();
-          });
-          const onStreamingError = (e: Error) => {
-            readStream.unpipe(writeStream);
-            defaultLogger.warn(
-              `Cannot pull '${remotePath}' to '${localPath}'. ` +
-                `The file will be skipped. Original error: ${e.message}`,
-            );
-            ++countFilesFail;
-            resolve();
-          };
-          writeStream.on('error', onStreamingError);
-          readStream.on('error', onStreamingError);
-        }).timeout(IO_TIMEOUT_MS),
-      );
-      readStream.pipe(writeStream);
-      if (pullPromises.length >= MAX_IO_CHUNK_SIZE) {
-        await B.any(pullPromises);
-        for (let i = pullPromises.length - 1; i >= 0; i--) {
-          if (pullPromises[i].isFulfilled()) {
-            pullPromises.splice(i, 1);
+    // Phase 2: Create all directories
+    for (const dirPath of dirsToCreate) {
+      if (!(await folderExists(dirPath))) {
+        await mkdirp(dirPath);
+      }
+    }
+
+    // Ensure parent directories exist for files
+    for (const {localPath} of filesToPull) {
+      const dirname = path.dirname(localPath);
+      if (!(await folderExists(dirname))) {
+        await mkdirp(dirname);
+      }
+    }
+
+    // Phase 3: Pull files
+    // For remotexpc (requiresSerialOps=true): use getFileContents() which properly
+    // awaits file handle closure before returning, preventing socket state corruption
+    // For appium-ios-device: use parallel streaming for better performance
+    if (requiresSerialOps) {
+      // Serial file pulling for remotexpc using getFileContents (not streams)
+      // This ensures each file operation completes fully before the next one starts
+      for (const {remotePath, localPath} of filesToPull) {
+        try {
+          const fileBuffer = await afcService.getFileContents(remotePath);
+          await fs.writeFile(localPath, fileBuffer);
+          ++countFilesSuccess;
+        } catch (e) {
+          defaultLogger.warn(
+            `Cannot pull '${remotePath}' to '${localPath}'. ` +
+              `The file will be skipped. Original error: ${(e as Error).message}`,
+          );
+          ++countFilesFail;
+        }
+      }
+    } else {
+      // Parallel file pulling for appium-ios-device (original behavior)
+      const pullPromises: B<void>[] = [];
+      for (const {remotePath, localPath} of filesToPull) {
+        const readStream = await afcService.createReadStream(remotePath, {autoDestroy: true});
+        const writeStream = fs.createWriteStream(localPath, {autoClose: true});
+        pullPromises.push(
+          new B<void>((resolve) => {
+            writeStream.on('close', () => {
+              ++countFilesSuccess;
+              resolve();
+            });
+            const onStreamingError = (e: Error) => {
+              readStream.unpipe(writeStream);
+              defaultLogger.warn(
+                `Cannot pull '${remotePath}' to '${localPath}'. ` +
+                  `The file will be skipped. Original error: ${e.message}`,
+              );
+              ++countFilesFail;
+              resolve();
+            };
+            writeStream.on('error', onStreamingError);
+            readStream.on('error', onStreamingError);
+          }).timeout(IO_TIMEOUT_MS),
+        );
+        readStream.pipe(writeStream);
+        if (pullPromises.length >= MAX_IO_CHUNK_SIZE) {
+          await B.any(pullPromises);
+          for (let i = pullPromises.length - 1; i >= 0; i--) {
+            if (pullPromises[i].isFulfilled()) {
+              pullPromises.splice(i, 1);
+            }
           }
         }
       }
-    });
-    // Wait for the rest of files to be pulled
-    if (!_.isEmpty(pullPromises)) {
-      await B.all(pullPromises);
+
+      // Wait for the rest of files to be pulled
+      if (!_.isEmpty(pullPromises)) {
+        await B.all(pullPromises);
+      }
     }
+
     defaultLogger.info(
       `Pulled ${util.pluralize('file', countFilesSuccess, true)} out of ` +
         `${countFilesSuccess + countFilesFail} and ${util.pluralize(
@@ -371,9 +422,14 @@ export class RealDevice {
   async install(appPath: string, bundleId: string, opts: RealDeviceInstallOptions = {}): Promise<void> {
     const {
       timeoutMs = IO_TIMEOUT_MS,
+      platformVersion,
     } = opts;
     const timer = new timing.Timer().start();
-    const afcService = await services.startAfcService(this.udid);
+
+    // Create opts object for AFC service selection
+    const driverOpts = platformVersion ? { platformVersion } as XCUITestDriverOpts : undefined;
+    const afcService = await startAfcService(this.udid, driverOpts);
+
     try {
       let bundlePathOnPhone: string;
       if ((await fs.stat(appPath)).isFile()) {
@@ -651,10 +707,14 @@ export async function installToRealDevice(
   }
   this.log.debug(`Installing '${app}' on the device with UUID '${device.udid}'`);
 
+  // Pass platformVersion for iOS 18+ AFC service selection
+  const installOpts: RealDeviceInstallOptions = {
+    timeoutMs: timeout,
+    platformVersion: this.opts.platformVersion,
+  };
+
   try {
-    await device.install(app, bundleId, {
-      timeoutMs: timeout,
-    });
+    await device.install(app, bundleId, installOpts);
     this.log.debug('The app has been installed successfully.');
   } catch (e) {
     // Want to clarify the device's application installation state in this situation.
@@ -675,9 +735,7 @@ export async function installToRealDevice(
       `be already cached on the device, probably with a different signature. ` +
       `Will try to remove it and install a new copy. Original error: ${(e as Error).message}`);
     await device.remove(bundleId);
-    await device.install(app, bundleId, {
-      timeoutMs: timeout,
-    });
+    await device.install(app, bundleId, installOpts);
     this.log.debug('The app has been installed after one retrial.');
   }
 }
@@ -810,6 +868,8 @@ export interface PushFolderOptions {
 export interface RealDeviceInstallOptions {
   /** Application installation timeout in milliseconds */
   timeoutMs?: number;
+  /** Platform version for iOS 18+ detection */
+  platformVersion?: string;
 }
 
 export interface InstallOrUpgradeOptions {

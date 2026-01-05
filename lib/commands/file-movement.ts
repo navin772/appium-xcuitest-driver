@@ -7,6 +7,7 @@ import {
   pullFolder as realDevicePullFolder,
   pushFile as realDevicePushFile,
 } from '../device/real-device-management';
+import {startAfcService} from '../device/afc-service';
 import {errors} from 'appium/driver';
 import type {Simulator} from 'appium-ios-simulator';
 import type {XCUITestDriver} from '../driver';
@@ -219,7 +220,8 @@ async function createAfcClient(
   const udid = this.device.udid as string;
 
   if (!bundleId) {
-    return await services.startAfcService(udid);
+    // Use the AFC service adapter which handles iOS 18+ via remotexpc
+    return await startAfcService(udid, this.opts);
   }
   const service = await services.startHouseArrestService(udid);
 
